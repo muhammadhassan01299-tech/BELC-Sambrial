@@ -1,0 +1,6 @@
+{
+  "name": "BELC Sambrial - Premium Academy",
+  "description": "Official portal for Bismillah English Language Club (BELC) Sambrial - English language courses, computer training, AI bootcamp, visa assistance, and Umrah guidance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
