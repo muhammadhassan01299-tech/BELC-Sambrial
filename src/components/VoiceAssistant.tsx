@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { Volume2, VolumeX, Play, Pause, Square, RotateCcw, Sparkles } from 'lucide-react';
 import { ACADEMY_DATA } from '../data/academy';
 
@@ -7,7 +8,16 @@ interface VoiceAssistantProps {
   isUrdu: boolean;
 }
 
-type VoiceMode = 'ur' | 'hi' | 'en';
+type VoiceMode = 'ai' | 'ur' | 'hi' | 'en';
+
+// true  = a "Welcome / Enter" screen appears once per visit. The visitor's tap on it lets the
+//         browser play the greeting automatically (this is the ONLY reliable way, browsers block
+//         sound before any click).
+// false = no welcome screen; greeting starts on the visitor's first click/tap anywhere.
+const SHOW_WELCOME_GATE = true;
+
+// Real Urdu audio made by the server (Gemini) or the academy's own public/greeting.mp3
+const AUDIO_URL = '/api/greeting-audio';
 
 // Same greeting written in Hindi (Devanagari) letters.
 // Many phones/PCs have NO Urdu voice, but almost all have a Hindi voice, and spoken Hindi and
@@ -41,24 +51,118 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ theme, isUrdu })
   const [voiceMode, setVoiceMode] = useState<VoiceMode>('ur');
   // true while we are waiting for the visitor's first tap/click (browsers block sound before that)
   const [needsTap, setNeedsTap] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [showGate, setShowGate] = useState<boolean>(() => {
+    if (!SHOW_WELCOME_GATE || typeof window === 'undefined') return false;
+    try {
+      return sessionStorage.getItem('belc_greeted') !== '1';
+    } catch {
+      return true;
+    }
+  });
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const utterancesRef = useRef<SpeechSynthesisUtterance[]>([]); // keeps them alive (Chrome garbage-collects them otherwise)
   const genRef = useRef(0); // every new start gets a new number; old callbacks are ignored
   const mutedRef = useRef(false);
   const greetedRef = useRef(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const usingAudioRef = useRef(false);
+  const aiFailedRef = useRef(false); // true when the server has no audio -> use the device voice
 
   mutedRef.current = isMuted;
 
+  const markGreeted = () => {
+    try {
+      sessionStorage.setItem('belc_greeted', '1');
+    } catch {
+      /* ignore */
+    }
+  };
+
+  // The audio file (made once by the server) - loaded early so it starts instantly
+  const getAudio = (): HTMLAudioElement => {
+    if (audioRef.current) return audioRef.current;
+    const a = new Audio(AUDIO_URL);
+    a.preload = 'auto';
+    a.onplaying = () => {
+      if (!usingAudioRef.current) return;
+      setIsLoading(false);
+      setIsPlaying(true);
+      setIsPaused(false);
+      setNeedsTap(false);
+      setVoiceMode('ai');
+      setActiveVoiceName('AI Urdu voice');
+      markGreeted();
+    };
+    a.onended = () => {
+      usingAudioRef.current = false;
+      setIsPlaying(false);
+      setIsPaused(false);
+    };
+    audioRef.current = a;
+    return a;
+  };
+
+  // Tries the audio file. Returns false only if it is not available (then the device voice is used).
+  const playAiAudio = async (): Promise<boolean> => {
+    if (aiFailedRef.current) return false;
+    try {
+      const a = getAudio();
+      usingAudioRef.current = true;
+      setIsLoading(true);
+      a.currentTime = 0;
+      await a.play();
+      return true;
+    } catch (err: any) {
+      usingAudioRef.current = false;
+      setIsLoading(false);
+      if (err?.name === 'NotAllowedError') {
+        greetedRef.current = false;
+        setNeedsTap(true);
+        return true; // browser wants a click first - not a failure
+      }
+      if (err?.name === 'AbortError') return true; // stopped / replaced on purpose
+      aiFailedRef.current = true;
+      audioRef.current = null;
+      return false;
+    }
+  };
+
+  const stopAudio = () => {
+    const a = audioRef.current;
+    usingAudioRef.current = false;
+    if (a) {
+      a.pause();
+      try {
+        a.currentTime = 0;
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+
   // Always starts the greeting from the beginning
   const speak = () => {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
     greetedRef.current = true;
+    setShowGate(false);
     setShowTranscript(true);
     if (mutedRef.current) return;
 
-    const synth = window.speechSynthesis;
     const myId = ++genRef.current;
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) window.speechSynthesis.cancel();
+    stopAudio();
+
+    playAiAudio().then((ok) => {
+      if (!ok && genRef.current === myId) speakWithDeviceVoice(myId);
+    });
+  };
+
+  // Fallback: the voice that is installed on the visitor's device (Urdu -> Hindi -> English)
+  const speakWithDeviceVoice = (myId: number) => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+
+    const synth = window.speechSynthesis;
 
     const run = () => {
       if (genRef.current !== myId) return;
@@ -87,11 +191,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ theme, isUrdu })
           setIsPlaying(true);
           setIsPaused(false);
           setNeedsTap(false);
-          try {
-            sessionStorage.setItem('belc_greeted', '1');
-          } catch {
-            /* ignore */
-          }
+          markGreeted();
         };
         u.onend = () => {
           if (genRef.current !== myId) return;
@@ -127,6 +227,12 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ theme, isUrdu })
 
   const handlePlay = () => {
     if (isPaused) {
+      if (usingAudioRef.current && audioRef.current) {
+        audioRef.current.play().catch(() => {});
+        setIsPaused(false);
+        setIsPlaying(true);
+        return;
+      }
       window.speechSynthesis.resume();
       setIsPaused(false);
       setIsPlaying(true);
@@ -136,6 +242,12 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ theme, isUrdu })
   };
 
   const handlePause = () => {
+    if (usingAudioRef.current && audioRef.current) {
+      audioRef.current.pause();
+      setIsPaused(true);
+      setIsPlaying(false);
+      return;
+    }
     if (window.speechSynthesis.speaking) {
       window.speechSynthesis.pause();
       setIsPaused(true);
@@ -145,7 +257,9 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ theme, isUrdu })
 
   const handleStop = () => {
     genRef.current++;
-    window.speechSynthesis.cancel();
+    stopAudio();
+    window.speechSynthesis?.cancel();
+    setIsLoading(false);
     setIsPlaying(false);
     setIsPaused(false);
   };
@@ -159,7 +273,16 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ theme, isUrdu })
 
   // Setup: check support, load voices, and play the greeting automatically
   useEffect(() => {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+    if (typeof window === 'undefined') return;
+
+    // Start downloading the greeting audio right away so it plays instantly after the tap
+    try {
+      getAudio();
+    } catch {
+      /* ignore */
+    }
+
+    if (!('speechSynthesis' in window)) {
       setIsSupported(false);
       return;
     }
@@ -198,11 +321,14 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ theme, isUrdu })
         removeGesture();
         speak();
       };
-      const events: (keyof WindowEventMap)[] = ['click', 'touchend', 'keydown'];
+      // With the welcome screen we skip "touchend": closing the screen on touchend would let the
+      // finger's click fall through onto the page below.
+      const events: (keyof WindowEventMap)[] = SHOW_WELCOME_GATE ? ['click', 'keydown'] : ['click', 'touchend', 'keydown'];
       events.forEach((ev) => window.addEventListener(ev, onGesture, { passive: true }));
       removeGesture = () => events.forEach((ev) => window.removeEventListener(ev, onGesture));
 
-      timer = window.setTimeout(speak, 700);
+      // Without the welcome screen, try once right away (works only in a few browsers)
+      if (!SHOW_WELCOME_GATE) timer = window.setTimeout(speak, 700);
     }
 
     return () => {
@@ -211,11 +337,79 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ theme, isUrdu })
       synth.removeEventListener('voiceschanged', updateVoices);
       genRef.current++;
       synth.cancel();
+      stopAudio();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    if (!showGate) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, [showGate]);
+
+  // Welcome screen buttons
+  const enterWithSound = () => {
+    if (greetedRef.current) {
+      setShowGate(false);
+      return;
+    }
+    speak();
+  };
+  const enterSilently = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    greetedRef.current = true;
+    markGreeted();
+    setNeedsTap(false);
+    setShowGate(false);
+  };
+
   const isDark = theme === 'dark';
+
+  const gate =
+    showGate && typeof document !== 'undefined'
+      ? createPortal(
+          <div
+            onClick={enterWithSound}
+            role="dialog"
+            aria-label="Welcome"
+            className="fixed inset-0 z-[100] flex items-center justify-center p-6 cursor-pointer bg-gradient-to-br from-[#1a0b1f]/95 via-[#0b1020]/95 to-[#10204a]/95 backdrop-blur-xl text-white animate-in"
+          >
+            <div className="max-w-md text-center">
+              <div className="mx-auto mb-6 w-20 h-20 rounded-3xl bg-gradient-to-br from-red-500 to-rose-800 flex items-center justify-center text-4xl font-extrabold shadow-2xl shadow-red-900/50">
+                B
+              </div>
+              <p className="font-urdu text-3xl mb-2" dir="rtl">
+                بسم اللہ الرحمن الرحیم
+              </p>
+              <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight">Bismillah English Language Club</h2>
+              <p className="mt-1 text-sm text-zinc-300 tracking-widest uppercase">Sambrial</p>
+
+              <button
+                type="button"
+                className="mt-8 inline-flex items-center gap-2 px-7 py-3.5 rounded-2xl bg-red-600 hover:bg-red-700 font-bold shadow-lg shadow-red-600/40 transition-all hover:scale-105 active:scale-95 cursor-pointer"
+              >
+                <Volume2 className="w-5 h-5" />
+                <span>Enter Website</span>
+                <span className="font-urdu">· داخل ہوں</span>
+              </button>
+              <p className="mt-3 text-xs text-zinc-400">Tap anywhere to enter · a short Urdu welcome message will play</p>
+
+              <button
+                type="button"
+                onClick={enterSilently}
+                className="mt-5 text-xs text-zinc-400 underline underline-offset-4 hover:text-white cursor-pointer"
+              >
+                Enter without sound
+              </button>
+            </div>
+          </div>,
+          document.body
+        )
+      : null;
 
   return (
     <div
@@ -226,6 +420,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ theme, isUrdu })
           : 'bg-white/95 border-zinc-200 text-zinc-900 shadow-lg shadow-zinc-200/50'
       }`}
     >
+      {gate}
       <div className="flex flex-wrap items-center justify-between gap-3">
         {/* Left: Info & Soundwaves */}
         <div className="flex items-center gap-3">
@@ -256,6 +451,10 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({ theme, isUrdu })
                 ? isUrdu
                   ? 'آواز روکی گئی ہے'
                   : 'Audio paused'
+                : isLoading
+                ? isUrdu
+                  ? 'آڈیو تیار ہو رہی ہے...'
+                  : 'Preparing audio...'
                 : needsTap
                 ? isUrdu
                   ? 'آواز سننے کے لیے صفحے پر کہیں بھی ٹیپ کریں'

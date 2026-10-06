@@ -27,6 +27,12 @@ const CHAT_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
 // Gemini Flash models understand audio directly, so the same model also transcribes speech
 const TRANSCRIBE_MODEL = process.env.GEMINI_TRANSCRIBE_MODEL || CHAT_MODEL;
 
+// Text-to-speech model for the Urdu welcome greeting (see /api/greeting-audio)
+const TTS_MODELS = [process.env.GEMINI_TTS_MODEL, 'gemini-3.1-flash-tts-preview', 'gemini-2.5-flash-preview-tts'].filter(
+  (m, i, a): m is string => Boolean(m) && a.indexOf(m) === i
+);
+const TTS_VOICE = process.env.GEMINI_TTS_VOICE || 'Kore';
+
 const GEMINI_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const hasGeminiKey = () => GEMINI_KEY !== '' && GEMINI_KEY !== 'MY_GEMINI_API_KEY';
 
@@ -390,6 +396,109 @@ const k=sessionStorage.getItem('k');if(k){document.getElementById('key').value=k
 </script></body></html>`);
 });
 
+// ---- Urdu welcome greeting as a real audio file ------------------------------
+// Many phones/PCs have no Urdu voice, so the server makes the audio once with Gemini TTS,
+// saves it as a .wav file and every visitor then plays that same file.
+// Want the academy's OWN recording instead? Put  greeting.mp3  inside the "public" folder.
+// Keep this text the same as scriptUrdu in src/data/academy.ts
+const GREETING_URDU =
+  'بسم اللہ انگلش لینگویج کلب سمبڑیال میں خوش آمدید۔ سر محمد قاسم اور ماہر اساتذہ کی زیرِ نگرانی آئیلٹس، پی ٹی ای، سپوکن انگلش، جدید اے آئی بوٹ کیمپ، اسٹڈی ویزا اور عمرہ سروسز کے لیے ہم آپ کی خدمت میں حاضر ہیں۔ مزید معلومات کے لیے واٹس ایپ پر رابطہ کریں۔';
+
+const staticRoot = path.resolve(__dirname, isProd ? 'dist' : 'public');
+
+// Raw 16-bit PCM audio from Gemini -> normal .wav file that every browser can play
+function pcmToWav(pcm: Buffer, sampleRate: number): Buffer {
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16); // fmt chunk size
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28); // byte rate
+  header.writeUInt16LE(2, 32); // block align
+  header.writeUInt16LE(16, 34); // bits per sample
+  header.write('data', 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+let greetingPending: Promise<string> | null = null;
+
+// Returns the path of the greeting .wav (creates it with Gemini the first time)
+function getGreetingFile(): Promise<string> {
+  if (greetingPending) return greetingPending;
+
+  greetingPending = (async () => {
+    // file name changes when the text/voice changes, so edits are picked up automatically
+    const tag = Buffer.from(GREETING_URDU + TTS_VOICE).reduce((h, b) => (h * 31 + b) >>> 0, 7).toString(16);
+    const file = path.join(dataDir, `greeting-ur-${tag}.wav`);
+    if (fs.existsSync(file)) return file;
+
+    const ai = new GoogleGenAI({ apiKey: GEMINI_KEY });
+    const prompt = `Read the following in clear, warm, professional Urdu with a natural Pakistani accent, at a calm welcoming pace:\n\n${GREETING_URDU}`;
+
+    let lastError: unknown = null;
+    for (const model of TTS_MODELS) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: TTS_VOICE } } },
+          } as any,
+        });
+        const part: any = response.candidates?.[0]?.content?.parts?.find((p: any) => p?.inlineData?.data);
+        if (!part) throw new Error('No audio came back from ' + model);
+
+        const raw = Buffer.from(part.inlineData.data, 'base64');
+        const mime = String(part.inlineData.mimeType || '');
+        const rate = Number(/rate=(\d+)/.exec(mime)?.[1]) || 24000;
+        const wav = mime.includes('wav') ? raw : pcmToWav(raw, rate);
+
+        fs.mkdirSync(dataDir, { recursive: true });
+        fs.writeFileSync(file, wav);
+        console.log(`[tts] Urdu greeting created with ${model} (${Math.round(wav.length / 1024)} KB)`);
+        return file;
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`[tts] ${model} failed:`, err?.message || err);
+      }
+    }
+    throw lastError || new Error('Text-to-speech failed');
+  })();
+
+  // if it failed, allow a new try on the next request
+  greetingPending.catch(() => {
+    greetingPending = null;
+  });
+  return greetingPending;
+}
+
+app.get('/api/greeting-audio', rateLimit(30, 60_000), async (_req, res) => {
+  try {
+    // 1) the academy's own recording (public/greeting.mp3 or .wav) always wins
+    for (const name of ['greeting.mp3', 'greeting.wav', 'greeting.m4a']) {
+      const own = path.join(staticRoot, name);
+      if (fs.existsSync(own)) {
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        return res.sendFile(own);
+      }
+    }
+    // 2) otherwise the Gemini-made file
+    if (!hasGeminiKey()) return res.status(503).json({ error: 'No greeting audio available.' });
+    const file = await getGreetingFile();
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    return res.type('audio/wav').sendFile(file); // sendFile also supports Range requests (needed by Safari)
+  } catch (err: any) {
+    console.error('Greeting audio error:', err?.message || err);
+    return res.status(503).json({ error: 'Greeting audio is not available right now.' });
+  }
+});
+
 // Unknown /api/... URLs must return JSON, not the website
 app.all('/api/*', (_req, res) => {
   res.status(404).json({ error: 'Not found' });
@@ -400,6 +509,11 @@ app.all('/api/*', (_req, res) => {
 // ---------------------------------------------------------------------------
 async function start() {
   await initDb(dataDir);
+
+  // Prepare the Urdu greeting audio in the background
+  if (hasGeminiKey()) {
+    getGreetingFile().catch(() => console.warn('[tts] Could not prepare greeting audio (voice will use the device voice instead).'));
+  }
 
   if (isProd) {
     const dist = path.resolve(__dirname, 'dist');
